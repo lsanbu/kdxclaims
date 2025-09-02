@@ -2,7 +2,7 @@ python-telegram-bot==20.6
 supabase-auth==2.12.3
 supabase-functions==0.10.1
 requests
-BackgroundScheduler
+APScheduler>=3.10
 fastapi>=0.111
 uvicorn[standard]>=0.30
 python-dotenv>=1.0
