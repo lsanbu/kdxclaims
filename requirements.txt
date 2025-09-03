@@ -1,21 +1,9 @@
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
+pydantic==2.8.2
 python-dotenv==1.0.1
 requests==2.32.3
 httpx==0.28.1
 supabase==2.6.0
 apscheduler==3.10.4
 tzdata==2024.1
-pydantic==2.8.2
-python-telegram-bot==20.6
-supabase-auth==2.12.3
-supabase-functions==0.10.1
-requests
-APScheduler>=3.10
-uvicorn[standard]>=0.30
-
-# 1) Clean out conflicting versions
-#pip uninstall -y supabase supabase-auth supabase-functions httpx postgrest storage3 gotrue supafunc
-
-# 2) Reinstall a consistent set (tested combo)
-#pip install "httpx[http2]==0.28.1" "supabase==2.18.1" "supabase-auth==2.12.3" "supabase-functions==0.10.1"
