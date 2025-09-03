@@ -33,8 +33,8 @@ services:
     envVars:
       - key: API_BASE
         value: https://kdxclaims-api.onrender.com
-    script: |
-      curl -sS -X POST "$API_BASE/reminders/weekly" \
+    command: >
+      curl -sS -X POST "$API_BASE/reminders/weekly"
       -H "Content-Type: application/json" -d "{}"
 
   # --- Daily Pre-Cutoff (daily 9:00 AM IST == 03:30 UTC) ---
@@ -46,6 +46,6 @@ services:
     envVars:
       - key: API_BASE
         value: https://kdxclaims-api.onrender.com
-    script: |
-      curl -sS -X POST "$API_BASE/reminders/precutoff" \
+    command: >
+      curl -sS -X POST "$API_BASE/reminders/precutoff"
       -H "Content-Type: application/json" -d "{}"
