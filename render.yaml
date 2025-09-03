@@ -1,5 +1,4 @@
 services:
-  # --- FastAPI Web Service ---
   - type: web
     name: kdxclaims-api
     env: python
@@ -23,29 +22,3 @@ services:
       pip install -r requirements.txt
     startCommand: |
       uvicorn main:app --host 0.0.0.0 --port $PORT
-
-  # --- Weekly Reminder (Mon 9:00 AM IST == 03:30 UTC) ---
-  - type: cron
-    name: kdxclaims-weekly-reminder
-    plan: free
-    region: singapore
-    schedule: "30 3 * * 1"   # UTC
-    envVars:
-      - key: API_BASE
-        value: https://kdxclaims-api.onrender.com
-    command: >
-      curl -sS -X POST "$API_BASE/reminders/weekly"
-      -H "Content-Type: application/json" -d "{}"
-
-  # --- Daily Pre-Cutoff (daily 9:00 AM IST == 03:30 UTC) ---
-  - type: cron
-    name: kdxclaims-precutoff-reminder
-    plan: free
-    region: singapore
-    schedule: "30 3 * * *"   # UTC
-    envVars:
-      - key: API_BASE
-        value: https://kdxclaims-api.onrender.com
-    command: >
-      curl -sS -X POST "$API_BASE/reminders/precutoff"
-      -H "Content-Type: application/json" -d "{}"
