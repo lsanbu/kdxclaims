@@ -4,11 +4,11 @@ services:
     name: kdxclaims-api
     env: python
     plan: free
-    region: singapore                # pick closest region
+    region: singapore
     autoDeploy: true
     healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION          # lock python for resolver stability
+      - key: PYTHON_VERSION
         value: 3.11.7
       - key: SUPABASE_URL
         sync: false
@@ -29,12 +29,12 @@ services:
     name: kdxclaims-weekly-reminder
     plan: free
     region: singapore
-    schedule: "30 3 * * 1"           # UTC
+    schedule: "30 3 * * 1"   # UTC
     envVars:
       - key: API_BASE
         value: https://kdxclaims-api.onrender.com
-    command: >
-      curl -sS -X POST "$API_BASE/reminders/weekly"
+    script: |
+      curl -sS -X POST "$API_BASE/reminders/weekly" \
       -H "Content-Type: application/json" -d "{}"
 
   # --- Daily Pre-Cutoff (daily 9:00 AM IST == 03:30 UTC) ---
@@ -42,10 +42,10 @@ services:
     name: kdxclaims-precutoff-reminder
     plan: free
     region: singapore
-    schedule: "30 3 * * *"           # UTC
+    schedule: "30 3 * * *"   # UTC
     envVars:
       - key: API_BASE
         value: https://kdxclaims-api.onrender.com
-    command: >
-      curl -sS -X POST "$API_BASE/reminders/precutoff"
+    script: |
+      curl -sS -X POST "$API_BASE/reminders/precutoff" \
       -H "Content-Type: application/json" -d "{}"
