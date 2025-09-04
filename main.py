@@ -5,6 +5,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, date, timedelta
 import zoneinfo
+import requests
 
 if __name__ == "__main__":
     import uvicorn
@@ -21,6 +22,14 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or your domain(s)
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -184,20 +193,29 @@ def upload_claim(claim: ClaimIn):
         summary += f"\nLast bill in period: {last_txn['claim_date']} ₹{last_txn['total_rs']:,.2f}"
 
     ack += summary
+
+    # ✅ send the ack to Telegram
+    if BOT_TOKEN:  # only if token is configured
+        send_tg(claim.telegram_chat_id, ack)
+
     return {"ack": ack, "chat_id": claim.telegram_chat_id}
-
-import requests
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 def send_tg(chat_id: int, text: str):
     if not BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
-    except Exception:
-        pass
+        r = requests.post(url, json={
+            "chat_id": chat_id,
+            "text": text
+            # "parse_mode": "HTML",  # enable if you format messages in HTML
+            # "disable_web_page_preview": True
+        }, timeout=10)
+        if r.status_code != 200:
+            # helpful log if something is wrong (401 bad token, 400 chat not found, etc.)
+            print("TG send error:", r.status_code, r.text)
+    except Exception as e:
+        print("TG send exception:", e)
 
 def list_users():
     res = supabase.table("user_telegram").select("user_id, telegram_chat_id").execute()
