@@ -196,6 +196,11 @@ DATE_PATTERNS = [
     r"\b(\d{1,2}\s*-\s*[A-Za-z]{3}\s*-\s*\d{4})\b",                # 14 - Jul - 2025
     r"\b([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b",                      # Jul 14, 2025
 ]
+# put near other patterns
+# Allow spaces around colons and odd unicode colons
+TIME_PATTERNS = [
+    r"(?<!\d)(\d{1,2}\s*[:：]\s*\d{2}(?:\s*[:：]\s*\d{2})?)(?!\d)"
+]
 AMOUNT_PATTERNS = [
     r"(?:Amount|Amt|Total|Grand\s*Total|Preset\s*Value)\s*[:=]?\s*₹?\s*([0-9][\d,]*\.?\d{0,2})\b",
     r"\b(?:INR|Rs\.?|₹)\s*([0-9][\d,]*\.?\d{0,2})\b",
@@ -252,28 +257,59 @@ def _normalize_date_any(cand: str | None) -> str | None:
         except: pass
     return None
 
+# Allow spaces around colons and odd unicode colons
+TIME_PATTERNS = [
+    r"(?<!\d)(\d{1,2}\s*[:：]\s*\d{2}(?:\s*[:：]\s*\d{2})?)(?!\d)"
+]
+
+def _normalize_time(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    # collapse spaces and fullwidth colon to ASCII colon
+    s = s.strip().replace("：", ":")
+    s = re.sub(r"\s*:\s*", ":", s)
+    # basic sanity (00–23:00–59:00–59), be permissive if seconds missing
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
+    if not m:
+        return s  # return as-is if it looks like a time but format is odd
+    hh, mm, ss = m.group(1), m.group(2), m.group(3) or None
+    try:
+        h = int(hh); m_ = int(mm); s_ = int(ss) if ss is not None else None
+        if not (0 <= h <= 23 and 0 <= m_ <= 59 and (s_ is None or 0 <= s_ <= 59)):
+            return s
+    except:
+        return s
+    return f"{h:02d}:{m_:02d}:{(s_ if s_ is not None else 0):02d}" if ss is not None else f"{h:02d}:{m_:02d}"
+
 def _source_from_text(t: str) -> str | None:
     for pat, label in SOURCE_PATTERNS:
         if re.search(pat, t, re.IGNORECASE):
             return label
     return None
-
 def _parse_bill_text_strict(text: str):
     t = _norm(text)
     txn_date_raw = _first(DATE_PATTERNS, t)
     txn_date = _normalize_date_any(txn_date_raw)
+
     ref_txn = _first(REF_PATTERNS, t)
     amt_raw = _first(AMOUNT_PATTERNS, t)
     total_amount = _norm_amount_str(amt_raw)
+
     rate = _first(RATE_PATTERNS, t)
     rate_val = _norm_amount_str(rate)
     vol = _first(VOL_PATTERNS, t)
     vol_val = _norm_amount_str(vol)
+
+    time_raw = _first(TIME_PATTERNS, t)
+    time_norm = _normalize_time(time_raw)
+
     if total_amount is None and rate_val is not None and vol_val is not None:
         total_amount = round(rate_val * vol_val, 2)
+
     return {
         "txn_date": txn_date,
         "reference_no": ref_txn,
+        "time": time_norm,                           # <-- return it
         "total_amount": total_amount,
         "rate_rs_per_l": rate_val,
         "volume_l": vol_val,
@@ -299,12 +335,12 @@ async def extract(file: UploadFile = File(...)):
             return {
                 "transaction_id": f.get("reference_no"),
                 "txn_date": f.get("txn_date"),
-                "time": None,
+                "time": f.get("time"),               # <-- use parsed time
                 "total_amount": f.get("total_amount"),
                 "source": f.get("source"),
                 "rate_rs_per_l": f.get("rate_rs_per_l"),
                 "volume_l": f.get("volume_l"),
-                "raw_text": text
+                "raw_text": text[:5000],
             }
 
         # Normal path (local Tesseract)
