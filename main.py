@@ -1,4 +1,4 @@
-# main.py — KDxClaims API (consolidated)
+# main.py — KDxClaims API (hardened consolidated)
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Optional, Dict, Any, Tuple
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -22,7 +22,7 @@ from dataclasses import asdict
 from receipt_ocr import parse_receipt_image
 import cv2, pytesseract
 
-# ---------- App setup ----------
+# ---------------- App setup ----------------
 load_dotenv()
 app = FastAPI()
 
@@ -40,9 +40,25 @@ def root():
 
 @app.get("/health")
 def health():
+    # ISO UTC timestamp so external monitors can parse reliably
     return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
-# ---------- Supabase + Config ----------
+# ---------------- Logging & middleware ----------------
+logger = logging.getLogger("uvicorn.error")
+logging.basicConfig(level=logging.INFO)
+
+@app.middleware("http")
+async def log_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        # Always return JSON (avoid Render's HTML error page)
+        return JSONResponse(status_code=500, content={"ok": False, "error": "Internal Server Error"})
+
+# ---------------- Supabase + Config ----------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
@@ -62,7 +78,7 @@ def _sb() -> Client:
         raise RuntimeError("Supabase client not initialized yet")
     return supabase
 
-# ---------- Models ----------
+# ---------------- Models ----------------
 class ClaimIn(BaseModel):
     telegram_user_id: int
     telegram_chat_id: int
@@ -76,18 +92,7 @@ class ClaimIn(BaseModel):
     volume_l: Optional[float] = None
     notes: Optional[str] = None
 
-# ---------- Middleware ----------
-logger = logging.getLogger("uvicorn.error")
-
-@app.middleware("http")
-async def log_errors(request, call_next):
-    try:
-        return await call_next(request)
-    except Exception:
-        logger.exception(f"Unhandled error on {request.method} {request.url.path}")
-        raise
-
-# ---------- Helpers ----------
+# ---------------- Helpers ----------------
 def get_user_id(telegram_user_id: int) -> str:
     result = (
         _sb().table("user_telegram")
@@ -101,7 +106,10 @@ def get_user_id(telegram_user_id: int) -> str:
 
 def get_user_prefs(user_id: str) -> Dict[str, Any]:
     res = _sb().table("user_prefs").select("*").eq("user_id", user_id).execute()
-    return res.data[0] if res.data else {"cutoff_day": 15, "tz": "Asia/Kolkata", "weekly_reminder": True, "daily_pre_cutoff": True}
+    return res.data[0] if res.data else {
+        "cutoff_day": 15, "tz": "Asia/Kolkata",
+        "weekly_reminder": True, "daily_pre_cutoff": True
+    }
 
 def current_period(cutoff_day: int, tzname: str) -> Tuple[date, date]:
     tz = zoneinfo.ZoneInfo(tzname)
@@ -119,7 +127,10 @@ def current_period(cutoff_day: int, tzname: str) -> Tuple[date, date]:
 
     if now.day <= cutoff_day:
         start_m = month_add(now.replace(day=1), -1)
-        start_day = min(cutoff_day + 1, 28 if start_m.month == 2 and not (start_m.year % 4 == 0 and (start_m.year % 100 != 0 or start_m.year % 400 == 0)) else 31)
+        # guard for Feb/non-31 months
+        last_day_lookup = [31, 29 if start_m.year % 4 == 0 and (start_m.year % 100 != 0 or start_m.year % 400 == 0) else 28,
+                           31,30,31,30,31,31,30,31,30,31]
+        start_day = min(cutoff_day + 1, last_day_lookup[start_m.month - 1])
         start = start_m.replace(day=start_day)
         end = now.replace(day=cutoff_day)
     else:
@@ -145,62 +156,64 @@ def period_totals(user_id: str, start: date, end: date):
 
 def send_tg(chat_id: int, text: str):
     if not BOT_TOKEN:
-        print("TG send skipped: BOT_TOKEN missing")
+        logger.info("TG send skipped: BOT_TOKEN missing")
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
         if r.status_code != 200:
-            print("TG send error:", r.status_code, r.text)
+            logger.warning("TG send error: %s %s", r.status_code, r.text)
     except Exception as e:
-        print("TG send exception:", repr(e))
+        logger.warning("TG send exception: %r", e)
 
 def list_users():
     res = _sb().table("user_telegram").select("user_id, telegram_chat_id").execute()
     return res.data or []
 
-# ---------- OCR.space config & helpers ----------
+# ---------------- OCR.space config & helpers ----------------
 OCRSPACE_KEY = os.getenv("OCRSPACE_KEY")
 OCRSPACE_URL = "https://api.ocr.space/parse/image"
 
 def _ocrspace_from_url(image_url: str) -> str:
     if not OCRSPACE_KEY:
-        raise HTTPException(500, "OCRSPACE_KEY not configured")
-    resp = requests.post(
-        OCRSPACE_URL,
-        data={"apikey": OCRSPACE_KEY, "url": image_url, "OCREngine": 2, "language": "eng"},
-        timeout=30,
-    )
-    j = resp.json()
+        raise HTTPException(503, "OCRSPACE_KEY not configured")
+    try:
+        resp = requests.post(
+            OCRSPACE_URL,
+            data={"apikey": OCRSPACE_KEY, "url": image_url, "OCREngine": 2, "language": "eng"},
+            timeout=60,
+        )
+        j = resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"OCR network error: {e}")
     if not j.get("IsErroredOnProcessing") and j.get("ParsedResults"):
         return " \n".join(pr.get("ParsedText","") for pr in j["ParsedResults"])
-    raise HTTPException(502, f"OCR failed: {j.get('ErrorMessage')}")
+    raise HTTPException(502, f"OCR failed: {j.get('ErrorMessage') or j}")
 
 def _ocrspace_from_file(file_bytes: bytes) -> str:
     if not OCRSPACE_KEY:
-        raise HTTPException(500, "OCRSPACE_KEY not configured")
-    resp = requests.post(
-        OCRSPACE_URL,
-        files={"file": ("bill.jpg", file_bytes)},
-        data={"apikey": OCRSPACE_KEY, "OCREngine": 2, "language": "eng"},
-        timeout=60,
-    )
-    j = resp.json()
+        raise HTTPException(503, "OCRSPACE_KEY not configured")
+    try:
+        resp = requests.post(
+            OCRSPACE_URL,
+            files={"file": ("bill.jpg", file_bytes)},
+            data={"apikey": OCRSPACE_KEY, "OCREngine": 2, "language": "eng"},
+            timeout=120,
+        )
+        j = resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"OCR network error: {e}")
     if not j.get("IsErroredOnProcessing") and j.get("ParsedResults"):
         return " \n".join(pr.get("ParsedText","") for pr in j["ParsedResults"])
-    raise HTTPException(502, f"OCR failed: {j.get('ErrorMessage')}")
+    raise HTTPException(502, f"OCR failed: {j.get('ErrorMessage') or j}")
 
-# ---- Fallback parser (robust regex) ----
+# ---------------- Regex parser ----------------
 DATE_PATTERNS = [
-    r"\b(\d{1,2}\s*[-/]\s*\d{1,2}\s*[-/]\s*\d{2,4})\b",            # 13 - 09 - 2024
-    r"\b(\d{1,2}\s*-\s*[A-Za-z]{3}\s*-\s*\d{4})\b",                # 14 - Jul - 2025
-    r"\b([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b",                      # Jul 14, 2025
+    r"\b(\d{1,2}\s*[-/]\s*\d{1,2}\s*[-/]\s*\d{2,4})\b",
+    r"\b(\d{1,2}\s*-\s*[A-Za-z]{3}\s*-\s*\d{4})\b",
+    r"\b([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b",
 ]
-# put near other patterns
-# Allow spaces around colons and odd unicode colons
-TIME_PATTERNS = [
-    r"(?<!\d)(\d{1,2}\s*[:：]\s*\d{2}(?:\s*[:：]\s*\d{2})?)(?!\d)"
-]
+TIME_PATTERNS = [r"(?<!\d)(\d{1,2}\s*[:：]\s*\d{2}(?:\s*[:：]\s*\d{2})?)(?!\d)"]
 AMOUNT_PATTERNS = [
     r"(?:Amount|Amt|Total|Grand\s*Total|Preset\s*Value)\s*[:=]?\s*₹?\s*([0-9][\d,]*\.?\d{0,2})\b",
     r"\b(?:INR|Rs\.?|₹)\s*([0-9][\d,]*\.?\d{0,2})\b",
@@ -209,12 +222,8 @@ REF_PATTERNS = [
     r"(?:TXN\s*NO|Txn\s*Id|TXN\s*Id|Transaction\s*Id)\s*[:#]?\s*([A-Z0-9\-\/]{5,})",
     r"(?:Invoice\s*No\.?|Receipt\s*No\.?|Rcpt\s*No\.?)\s*[:#]?\s*([A-Z0-9\-\/]{5,})",
 ]
-RATE_PATTERNS = [
-    r"(?:Rate|Rate\(Rs/?L\)|Rate/Ltr\.?)\s*[:=]?\s*([0-9]+(?:\.[0-9]{1,2})?)"
-]
-VOL_PATTERNS = [
-    r"(?:Volume|Vol|Qty)\s*(?:\(|L|Ltr|Litres|Ltrs)?\.?\s*[:=]?\s*0*([0-9]+(?:\.[0-9]{1,3})?)"
-]
+RATE_PATTERNS = [r"(?:Rate|Rate\(Rs/?L\)|Rate/Ltr\.?)\s*[:=]?\s*([0-9]+(?:\.[0-9]{1,2})?)"]
+VOL_PATTERNS  = [r"(?:Volume|Vol|Qty)\s*(?:\(|L|Ltr|Litres|Ltrs)?\.?\s*[:=]?\s*0*([0-9]+(?:\.[0-9]{1,3})?)"]
 SOURCE_PATTERNS = [
     (r"Indian\s*Oil|IndianOil|IOC", "IndianOil"),
     (r"\bHP\b|Hindustan\s*Petroleum", "HP"),
@@ -224,8 +233,8 @@ SOURCE_PATTERNS = [
 def _norm(s: str) -> str:
     s = s.replace("\r", "\n")
     s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\s*-\s*", "-", s)          # "JUL -2025" -> "JUL-2025"
-    s = re.sub(r"\s*/\s*", "/", s)          # "14 / 07 / 2025" -> "14/07/2025"
+    s = re.sub(r"\s*-\s*", "-", s)   # "JUL -2025" -> "JUL-2025"
+    s = re.sub(r"\s*/\s*", "/", s)   # "14 / 07 / 2025" -> "14/07/2025"
     return s
 
 def _first(patterns, text, flags=re.IGNORECASE):
@@ -244,7 +253,7 @@ def _norm_amount_str(x: str | None) -> float | None:
 def _normalize_date_any(cand: str | None) -> str | None:
     if not cand: return None
     cand = cand.strip().replace("IUL", "JUL").replace("O", "0")
-    for fmt in ("%d/%m/%Y","%d-%m-%Y","%d/%m/%y","%d-%m-%y","%d-%b-%Y","%b %d, %Y","%d-%b-%y"):
+    for fmt in ("%d/%m/%Y","%d-%m-%Y","%d/%m/%y","%d-%m-%y","%d/%b/%Y","%d-%b-%Y","%b %d, %Y","%d-%b-%y"):
         try:
             return datetime.strptime(cand, fmt).strftime("%Y-%m-%d")
         except: continue
@@ -257,21 +266,14 @@ def _normalize_date_any(cand: str | None) -> str | None:
         except: pass
     return None
 
-# Allow spaces around colons and odd unicode colons
-TIME_PATTERNS = [
-    r"(?<!\d)(\d{1,2}\s*[:：]\s*\d{2}(?:\s*[:：]\s*\d{2})?)(?!\d)"
-]
-
 def _normalize_time(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
-    # collapse spaces and fullwidth colon to ASCII colon
     s = s.strip().replace("：", ":")
     s = re.sub(r"\s*:\s*", ":", s)
-    # basic sanity (00–23:00–59:00–59), be permissive if seconds missing
     m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
     if not m:
-        return s  # return as-is if it looks like a time but format is odd
+        return s
     hh, mm, ss = m.group(1), m.group(2), m.group(3) or None
     try:
         h = int(hh); m_ = int(mm); s_ = int(ss) if ss is not None else None
@@ -286,30 +288,26 @@ def _source_from_text(t: str) -> str | None:
         if re.search(pat, t, re.IGNORECASE):
             return label
     return None
+
 def _parse_bill_text_strict(text: str):
     t = _norm(text)
     txn_date_raw = _first(DATE_PATTERNS, t)
     txn_date = _normalize_date_any(txn_date_raw)
-
     ref_txn = _first(REF_PATTERNS, t)
     amt_raw = _first(AMOUNT_PATTERNS, t)
     total_amount = _norm_amount_str(amt_raw)
-
     rate = _first(RATE_PATTERNS, t)
     rate_val = _norm_amount_str(rate)
     vol = _first(VOL_PATTERNS, t)
     vol_val = _norm_amount_str(vol)
-
     time_raw = _first(TIME_PATTERNS, t)
     time_norm = _normalize_time(time_raw)
-
     if total_amount is None and rate_val is not None and vol_val is not None:
         total_amount = round(rate_val * vol_val, 2)
-
     return {
         "txn_date": txn_date,
         "reference_no": ref_txn,
-        "time": time_norm,                           # <-- return it
+        "time": time_norm,
         "total_amount": total_amount,
         "rate_rs_per_l": rate_val,
         "volume_l": vol_val,
@@ -317,25 +315,51 @@ def _parse_bill_text_strict(text: str):
         "preview": t[:600],
     }
 
-# ---------- OCR endpoint ----------
+# ---------------- Upload constraints ----------------
+ALLOWED_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
+MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+
+# ---------------- OCR endpoint ----------------
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     try:
-        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or '')[-1] or ".jpg", delete=False) as tmp:
-            shutil.copyfileobj(file.file, tmp)
-            tmp_path = tmp.name
+        if not file:
+            raise HTTPException(400, "Missing file field 'file'")
 
-        # Fallback if tesseract is not present (Native runtime)
-        if shutil.which("tesseract") is None:
+        ctype = (file.content_type or "").lower()
+        if ctype not in ALLOWED_TYPES:
+            raise HTTPException(415, f"Unsupported content type: {file.content_type}")
+
+        data = await file.read()
+        if not data:
+            raise HTTPException(400, "Empty file")
+        if len(data) > MAX_BYTES:
+            raise HTTPException(413, f"File too large (> {MAX_BYTES} bytes)")
+
+        # If Tesseract is available, use local pipeline; else fallback to OCR.space
+        if shutil.which("tesseract"):
+            # write to temp for parse_receipt_image()
+            suffix = os.path.splitext(file.filename or "")[-1] or ".jpg"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
+            try:
+                res = parse_receipt_image(tmp_path)
+                return asdict(res)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+        else:
             if not OCRSPACE_KEY:
                 raise HTTPException(503, "Tesseract not available and OCRSPACE_KEY not set.")
-            with open(tmp_path, "rb") as fh:
-                text = _ocrspace_from_file(fh.read())
+            text = _ocrspace_from_file(data)
             f = _parse_bill_text_strict(text)
             return {
                 "transaction_id": f.get("reference_no"),
                 "txn_date": f.get("txn_date"),
-                "time": f.get("time"),               # <-- use parsed time
+                "time": f.get("time"),
                 "total_amount": f.get("total_amount"),
                 "source": f.get("source"),
                 "rate_rs_per_l": f.get("rate_rs_per_l"),
@@ -343,17 +367,14 @@ async def extract(file: UploadFile = File(...)):
                 "raw_text": text[:5000],
             }
 
-        # Normal path (local Tesseract)
-        res = parse_receipt_image(tmp_path)
-        return asdict(res)
-
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("extract failed")
+        # Always JSON, never HTML
         raise HTTPException(status_code=500, detail=f"/extract failed: {type(e).__name__}: {e}")
 
-# ---------- Claims API ----------
+# ---------------- Claims API ----------------
 @app.post("/upload-claim")
 def upload_claim(claim: ClaimIn):
     valid_claim_types = {"fuel", "driver_salary", "insurance", "service", "accessories"}
@@ -419,11 +440,11 @@ def upload_claim(claim: ClaimIn):
     try:
         send_tg(claim.telegram_chat_id, ack)
     except Exception as e:
-        logger.warning("Non-fatal: telegram send failed: %s", repr(e))
+        logger.warning("Non-fatal: telegram send failed: %r", e)
 
     return {"ack": ack, "chat_id": claim.telegram_chat_id}
 
-# ---------- Reminders ----------
+# ---------------- Reminders ----------------
 @app.post("/reminders/weekly")
 def weekly_reminders():
     users = list_users()
@@ -465,7 +486,7 @@ def precutoff_reminders():
             send_tg(chat, msg); sent += 1
     return {"sent": sent}
 
-# ---------- Diagnostics ----------
+# ---------------- Diagnostics ----------------
 @app.get("/diag")
 def diag():
     return {
@@ -475,7 +496,7 @@ def diag():
         "tesseract_version": str(pytesseract.get_tesseract_version()) if shutil.which("tesseract") else None,
     }
 
-# ---------- OCR.space direct endpoint (optional) ----------
+# ---------------- OCR.space direct endpoint ----------------
 @app.post("/extract-bill")
 async def extract_bill(
     image_url: Optional[str] = Form(default=None),
@@ -502,7 +523,10 @@ async def extract_bill(
         logger.exception("extract-bill failed")
         raise HTTPException(500, "OCR/parse failed")
 
-# ---------- Local run ----------
+# ---------------- Local run ----------------
 if __name__ == "__main__":
+    # NOTE for Render: prefer gunicorn start command
+    # gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:$PORT --timeout 180
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
