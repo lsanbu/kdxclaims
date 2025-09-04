@@ -1,13 +1,4 @@
-# main.py  — KDxClaims API (consolidated)
-# --------------------------------------
-# Endpoints:
-#   GET  /                  -> service ping
-#   GET  /health            -> health check
-#   POST /extract           -> OCR (image file) via local Tesseract (receipt_ocr.py)
-#   POST /upload-claim      -> persist a claim (supports fuel & others)
-#   POST /reminders/weekly  -> send weekly summaries to all users
-#   POST /reminders/precutoff -> send daily reminders 5 days before cut-off
-#   POST /extract-bill      -> (optional) OCR.space-based parser; requires OCRSPACE_KEY
+# main.py — KDxClaims API (consolidated)
 
 from __future__ import annotations
 
@@ -18,7 +9,7 @@ import tempfile
 import shutil
 from datetime import datetime, date, timedelta
 import zoneinfo
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -29,10 +20,7 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 from dataclasses import asdict
 from receipt_ocr import parse_receipt_image
-import shutil
-from fastapi import HTTPException
-from dataclasses import asdict
-from receipt_ocr import parse_receipt_image
+import cv2, pytesseract
 
 # ---------- App setup ----------
 load_dotenv()
@@ -115,7 +103,7 @@ def get_user_prefs(user_id: str) -> Dict[str, Any]:
     res = _sb().table("user_prefs").select("*").eq("user_id", user_id).execute()
     return res.data[0] if res.data else {"cutoff_day": 15, "tz": "Asia/Kolkata", "weekly_reminder": True, "daily_pre_cutoff": True}
 
-def current_period(cutoff_day: int, tzname: str) -> tuple[date, date]:
+def current_period(cutoff_day: int, tzname: str) -> Tuple[date, date]:
     tz = zoneinfo.ZoneInfo(tzname)
     now = datetime.now(tz).date()
 
@@ -131,7 +119,6 @@ def current_period(cutoff_day: int, tzname: str) -> tuple[date, date]:
 
     if now.day <= cutoff_day:
         start_m = month_add(now.replace(day=1), -1)
-        # start is the day after last period's cutoff
         start_day = min(cutoff_day + 1, 28 if start_m.month == 2 and not (start_m.year % 4 == 0 and (start_m.year % 100 != 0 or start_m.year % 400 == 0)) else 31)
         start = start_m.replace(day=start_day)
         end = now.replace(day=cutoff_day)
@@ -141,7 +128,7 @@ def current_period(cutoff_day: int, tzname: str) -> tuple[date, date]:
         end = nm.replace(day=cutoff_day)
     return start, end
 
-def period_totals(user_id: str, start: date, end: date) -> tuple[float, Dict[str, float], Optional[Dict[str, Any]]]:
+def period_totals(user_id: str, start: date, end: date):
     q = (_sb().table("claims")
          .select("claim_type,total_rs,claim_date")
          .eq("user_id", user_id)
@@ -172,8 +159,129 @@ def list_users():
     res = _sb().table("user_telegram").select("user_id, telegram_chat_id").execute()
     return res.data or []
 
-# ---------- OCR (local Tesseract via receipt_ocr.py) ----------
-# uses your existing _ocrspace_from_file and _parse_bill_text helpers
+# ---------- OCR.space config & helpers ----------
+OCRSPACE_KEY = os.getenv("OCRSPACE_KEY")
+OCRSPACE_URL = "https://api.ocr.space/parse/image"
+
+def _ocrspace_from_url(image_url: str) -> str:
+    if not OCRSPACE_KEY:
+        raise HTTPException(500, "OCRSPACE_KEY not configured")
+    resp = requests.post(
+        OCRSPACE_URL,
+        data={"apikey": OCRSPACE_KEY, "url": image_url, "OCREngine": 2, "language": "eng"},
+        timeout=30,
+    )
+    j = resp.json()
+    if not j.get("IsErroredOnProcessing") and j.get("ParsedResults"):
+        return " \n".join(pr.get("ParsedText","") for pr in j["ParsedResults"])
+    raise HTTPException(502, f"OCR failed: {j.get('ErrorMessage')}")
+
+def _ocrspace_from_file(file_bytes: bytes) -> str:
+    if not OCRSPACE_KEY:
+        raise HTTPException(500, "OCRSPACE_KEY not configured")
+    resp = requests.post(
+        OCRSPACE_URL,
+        files={"file": ("bill.jpg", file_bytes)},
+        data={"apikey": OCRSPACE_KEY, "OCREngine": 2, "language": "eng"},
+        timeout=60,
+    )
+    j = resp.json()
+    if not j.get("IsErroredOnProcessing") and j.get("ParsedResults"):
+        return " \n".join(pr.get("ParsedText","") for pr in j["ParsedResults"])
+    raise HTTPException(502, f"OCR failed: {j.get('ErrorMessage')}")
+
+# ---- Fallback parser (robust regex) ----
+DATE_PATTERNS = [
+    r"\b(\d{1,2}\s*[-/]\s*\d{1,2}\s*[-/]\s*\d{2,4})\b",            # 13 - 09 - 2024
+    r"\b(\d{1,2}\s*-\s*[A-Za-z]{3}\s*-\s*\d{4})\b",                # 14 - Jul - 2025
+    r"\b([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b",                      # Jul 14, 2025
+]
+AMOUNT_PATTERNS = [
+    r"(?:Amount|Amt|Total|Grand\s*Total|Preset\s*Value)\s*[:=]?\s*₹?\s*([0-9][\d,]*\.?\d{0,2})\b",
+    r"\b(?:INR|Rs\.?|₹)\s*([0-9][\d,]*\.?\d{0,2})\b",
+]
+REF_PATTERNS = [
+    r"(?:TXN\s*NO|Txn\s*Id|TXN\s*Id|Transaction\s*Id)\s*[:#]?\s*([A-Z0-9\-\/]{5,})",
+    r"(?:Invoice\s*No\.?|Receipt\s*No\.?|Rcpt\s*No\.?)\s*[:#]?\s*([A-Z0-9\-\/]{5,})",
+]
+RATE_PATTERNS = [
+    r"(?:Rate|Rate\(Rs/?L\)|Rate/Ltr\.?)\s*[:=]?\s*([0-9]+(?:\.[0-9]{1,2})?)"
+]
+VOL_PATTERNS = [
+    r"(?:Volume|Vol|Qty)\s*(?:\(|L|Ltr|Litres|Ltrs)?\.?\s*[:=]?\s*0*([0-9]+(?:\.[0-9]{1,3})?)"
+]
+SOURCE_PATTERNS = [
+    (r"Indian\s*Oil|IndianOil|IOC", "IndianOil"),
+    (r"\bHP\b|Hindustan\s*Petroleum", "HP"),
+    (r"Bharat\s*Petroleum|BPCL", "BPCL"),
+]
+
+def _norm(s: str) -> str:
+    s = s.replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\s*-\s*", "-", s)          # "JUL -2025" -> "JUL-2025"
+    s = re.sub(r"\s*/\s*", "/", s)          # "14 / 07 / 2025" -> "14/07/2025"
+    return s
+
+def _first(patterns, text, flags=re.IGNORECASE):
+    for p in patterns:
+        m = re.search(p, text, flags)
+        if m:
+            return m.group(1).strip()
+    return None
+
+def _norm_amount_str(x: str | None) -> float | None:
+    if not x: return None
+    x = x.replace(",", "")
+    try: return float(x)
+    except: return None
+
+def _normalize_date_any(cand: str | None) -> str | None:
+    if not cand: return None
+    cand = cand.strip().replace("IUL", "JUL").replace("O", "0")
+    for fmt in ("%d/%m/%Y","%d-%m-%Y","%d/%m/%y","%d-%m-%y","%d-%b-%Y","%b %d, %Y","%d-%b-%y"):
+        try:
+            return datetime.strptime(cand, fmt).strftime("%Y-%m-%d")
+        except: continue
+    m = re.match(r"(\d{1,2})-([A-Za-z]{3})-(\d{2,4})", cand)
+    if m:
+        d, mon, y = m.groups()
+        if len(y)==2: y = ("20" if int(y)<50 else "19")+y
+        try:
+            return datetime.strptime(f"{d}-{mon}-{y}", "%d-%b-%Y").strftime("%Y-%m-%d")
+        except: pass
+    return None
+
+def _source_from_text(t: str) -> str | None:
+    for pat, label in SOURCE_PATTERNS:
+        if re.search(pat, t, re.IGNORECASE):
+            return label
+    return None
+
+def _parse_bill_text_strict(text: str):
+    t = _norm(text)
+    txn_date_raw = _first(DATE_PATTERNS, t)
+    txn_date = _normalize_date_any(txn_date_raw)
+    ref_txn = _first(REF_PATTERNS, t)
+    amt_raw = _first(AMOUNT_PATTERNS, t)
+    total_amount = _norm_amount_str(amt_raw)
+    rate = _first(RATE_PATTERNS, t)
+    rate_val = _norm_amount_str(rate)
+    vol = _first(VOL_PATTERNS, t)
+    vol_val = _norm_amount_str(vol)
+    if total_amount is None and rate_val is not None and vol_val is not None:
+        total_amount = round(rate_val * vol_val, 2)
+    return {
+        "txn_date": txn_date,
+        "reference_no": ref_txn,
+        "total_amount": total_amount,
+        "rate_rs_per_l": rate_val,
+        "volume_l": vol_val,
+        "source": _source_from_text(t),
+        "preview": t[:600],
+    }
+
+# ---------- OCR endpoint ----------
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     try:
@@ -181,29 +289,25 @@ async def extract(file: UploadFile = File(...)):
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
 
-        # If tesseract binary is not present, use OCR.space
+        # Fallback if tesseract is not present (Native runtime)
         if shutil.which("tesseract") is None:
             if not OCRSPACE_KEY:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Tesseract not available and OCRSPACE_KEY not set."
-                )
+                raise HTTPException(503, "Tesseract not available and OCRSPACE_KEY not set.")
             with open(tmp_path, "rb") as fh:
                 text = _ocrspace_from_file(fh.read())
-            fields = _parse_bill_text(text)
-            # Normalize to the same shape as OCRResult (best effort)
+            f = _parse_bill_text_strict(text)
             return {
-                "transaction_id": fields.get("reference_no"),
-                "txn_date": fields.get("txn_date"),
+                "transaction_id": f.get("reference_no"),
+                "txn_date": f.get("txn_date"),
                 "time": None,
-                "total_amount": fields.get("total_amount"),
-                "source": None,
-                "rate_rs_per_l": None,
-                "volume_l": None,
+                "total_amount": f.get("total_amount"),
+                "source": f.get("source"),
+                "rate_rs_per_l": f.get("rate_rs_per_l"),
+                "volume_l": f.get("volume_l"),
                 "raw_text": text
             }
 
-        # Normal path (local tesseract)
+        # Normal path (local Tesseract)
         res = parse_receipt_image(tmp_path)
         return asdict(res)
 
@@ -244,7 +348,6 @@ def upload_claim(claim: ClaimIn):
     if not insert_res.data:
         raise HTTPException(status_code=500, detail="Insert failed")
 
-    # Build ACK
     if claim.claim_type == "fuel":
         ack = (
             f"✅ Fuel claim saved\n"
@@ -255,12 +358,7 @@ def upload_claim(claim: ClaimIn):
             f"Amount: ₹{claim.total_rs:,.2f}"
         )
     else:
-        labels = {
-            "driver_salary": "Driver Salary",
-            "insurance": "Insurance",
-            "service": "Service",
-            "accessories": "Accessories",
-        }
+        labels = {"driver_salary": "Driver Salary","insurance": "Insurance","service": "Service","accessories": "Accessories"}
         kind = labels.get(claim.claim_type, claim.claim_type.title())
         ack = (
             f"✅ {kind} claim saved\n"
@@ -270,7 +368,6 @@ def upload_claim(claim: ClaimIn):
             f"Amount: ₹{claim.total_rs:,.2f}"
         )
 
-    # Period summary
     prefs = get_user_prefs(user_id)
     p_start, p_end = current_period(prefs["cutoff_day"], prefs["tz"])
     p_total, by_type, last_txn = period_totals(user_id, p_start, p_end)
@@ -283,7 +380,6 @@ def upload_claim(claim: ClaimIn):
         summary += f"\nLast bill in period: {last_txn['claim_date']} ₹{last_txn['total_rs']:,.2f}"
     ack += summary
 
-    # Send Telegram (best-effort)
     try:
         send_tg(claim.telegram_chat_id, ack)
     except Exception as e:
@@ -333,83 +429,7 @@ def precutoff_reminders():
             send_tg(chat, msg); sent += 1
     return {"sent": sent}
 
-# ---------- Optional: OCR.space fallback ----------
-OCRSPACE_KEY = os.getenv("OCRSPACE_KEY")
-OCRSPACE_URL = "https://api.ocr.space/parse/image"
-
-date_patterns = [
-    r"\b(\d{4}[-/]\d{2}[-/]\d{2})\b",
-    r"\b(\d{2}[-/]\d{2}[-/]\d{4})\b",
-    r"\b(\d{1,2}\s*[A-Za-z]{3,9}\s*\d{2,4})\b",
-]
-amount_patterns = [
-    r"(?:Total(?:\s*Amount)?|Amount\s*Payable|Grand\s*Total)[^\d]{0,10}([\ ₹₹Rs\.]*\d[\d,]*\.?\d{0,2})",
-    r"\b(?:INR|Rs\.?|₹)\s*([\d,]*\.?\d{1,2})\b",
-]
-ref_patterns = [
-    r"(?:Ref(?:erence)?|Invoice|Bill|Receipt|Txn|Transaction|Voucher)\s*(?:No\.?|#|:)?\s*([A-Z0-9\-\/]{5,})",
-]
-
-def _norm_amount(s: str) -> Optional[float]:
-    if not s: 
-        return None
-    s = s.replace("₹", "").replace("Rs.", "").replace("Rs", "").replace(" ", "").replace(",", "")
-    try:
-        return float(s)
-    except:
-        return None
-
-def _find_first(patterns, text, flags=re.IGNORECASE):
-    for p in patterns:
-        m = re.search(p, text, flags)
-        if m:
-            return m.group(1).strip()
-    return None
-
-def _ocrspace_from_url(image_url: str) -> str:
-    if not OCRSPACE_KEY:
-        raise HTTPException(500, "OCRSPACE_KEY not configured")
-    resp = requests.post(
-        OCRSPACE_URL,
-        data={"apikey": OCRSPACE_KEY, "url": image_url, "OCREngine": 2, "language": "eng"},
-        timeout=30,
-    )
-    j = resp.json()
-    if not j.get("IsErroredOnProcessing") and j.get("ParsedResults"):
-        return " \n".join(pr.get("ParsedText","") for pr in j["ParsedResults"])
-    raise HTTPException(502, f"OCR failed: {j.get('ErrorMessage')}")
-
-def _ocrspace_from_file(file_bytes: bytes) -> str:
-    if not OCRSPACE_KEY:
-        raise HTTPException(500, "OCRSPACE_KEY not configured")
-    resp = requests.post(
-        OCRSPACE_URL,
-        files={"file": ("bill.jpg", file_bytes)},
-        data={"apikey": OCRSPACE_KEY, "OCREngine": 2, "language": "eng"},
-        timeout=30,
-    )
-    j = resp.json()
-    if not j.get("IsErroredOnProcessing") and j.get("ParsedResults"):
-        return " \n".join(pr.get("ParsedText","") for pr in j["ParsedResults"])
-    raise HTTPException(502, f"OCR failed: {j.get('ErrorMessage')}")
-
-def _parse_bill_text(text: str):
-    t = re.sub(r"[ \t]+", " ", text)
-    txn_date  = _find_first(date_patterns, t)
-    ref_no    = _find_first(ref_patterns, t)
-    amt_raw   = _find_first(amount_patterns, t)
-    total_amt = _norm_amount(amt_raw)
-    return {
-        "txn_date": txn_date,
-        "reference_no": ref_no,
-        "total_amount": total_amt,
-        "raw_amount_match": amt_raw,
-        "preview": t[:600],
-    }
-
-# add to main.py
-import shutil, cv2, pytesseract
-
+# ---------- Diagnostics ----------
 @app.get("/diag")
 def diag():
     return {
@@ -419,28 +439,27 @@ def diag():
         "tesseract_version": str(pytesseract.get_tesseract_version()) if shutil.which("tesseract") else None,
     }
 
-
+# ---------- OCR.space direct endpoint (optional) ----------
 @app.post("/extract-bill")
 async def extract_bill(
     image_url: Optional[str] = Form(default=None),
     file: Optional[UploadFile] = File(default=None),
     telegram_chat_id: Optional[int] = Form(default=None),
 ):
-    """OCR.space fallback (URL or file)."""
     if not image_url and not file:
         raise HTTPException(400, "Provide image_url or file")
     try:
         text = _ocrspace_from_url(image_url) if image_url else _ocrspace_from_file(await file.read())
-        result = _parse_bill_text(text)
+        f = _parse_bill_text_strict(text)
         if telegram_chat_id:
             msg = (
                 "🧾 *Bill parsed*\n"
-                f"Ref: `{result.get('reference_no') or '—'}`\n"
-                f"Date: `{result.get('txn_date') or '—'}`\n"
-                f"Total: `{result.get('total_amount') or result.get('raw_amount_match') or '—'}`"
+                f"Ref: `{f.get('reference_no') or '—'}`\n"
+                f"Date: `{f.get('txn_date') or '—'}`\n"
+                f"Total: `{f.get('total_amount') or '—'}`"
             )
             send_tg(telegram_chat_id, msg)
-        return JSONResponse({"ok": True, "fields": result})
+        return JSONResponse({"ok": True, "fields": f})
     except HTTPException:
         raise
     except Exception:
