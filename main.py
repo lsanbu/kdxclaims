@@ -1,4 +1,4 @@
-# main.py — KDxClaims API (hardened consolidated)
+# main.py — KDxClaims API + Telegram Webhook (single service)
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import zoneinfo
 from typing import Optional, Dict, Any, Tuple
 
 import requests
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,11 +23,16 @@ from dataclasses import asdict
 from receipt_ocr import parse_receipt_image
 import cv2, pytesseract
 
+# --- Telegram imports ---
+from telegram import Update
+from telegram.constants import ChatAction, ParseMode
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
+
 # ---------------- App setup ----------------
 load_dotenv()
 app = FastAPI()
-
-# CORS (tighten allow_origins to your FE domain when you deploy)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,11 +42,10 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "kdxclaims-api"}
+    return {"ok": True, "service": "kdxclaims-api+tg"}
 
 @app.get("/health")
 def health():
-    # ISO UTC timestamp so external monitors can parse reliably
     return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
 # ---------------- Logging & middleware ----------------
@@ -55,27 +60,68 @@ async def log_errors(request: Request, call_next):
         raise
     except Exception:
         logger.exception("Unhandled error on %s %s", request.method, request.url.path)
-        # Always return JSON (avoid Render's HTML error page)
         return JSONResponse(status_code=500, content={"ok": False, "error": "Internal Server Error"})
 
-# ---------------- Supabase + Config ----------------
+# ---------------- Config ----------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-BOT_TOKEN     = os.getenv("BOT_TOKEN")
+BOT_TOKEN    = os.getenv("BOT_TOKEN")  # used by both API TG send & bot
+API_BASE     = os.getenv("API_BASE", "https://kdxclaims.onrender.com")
+WEBHOOK_URL  = os.getenv("WEBHOOK_URL", f"{API_BASE.rstrip('/')}/tg/")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY. Check your env vars.")
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY.")
 
+# ---------------- Globals ----------------
 supabase: Optional[Client] = None
+_httpx: Optional[httpx.AsyncClient] = None
+_ptb_app: Optional[Application] = None
 
+# ---------------- FastAPI lifecycle ----------------
 @app.on_event("startup")
-def _startup():
+async def _startup():
+    # Supabase
     global supabase
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+    # Async HTTP client
+    global _httpx
+    _httpx = httpx.AsyncClient(timeout=60)
+
+    # Telegram bot (webhook mode)
+    if not BOT_TOKEN:
+        logger.warning("BOT_TOKEN not set — Telegram webhook disabled.")
+        return
+
+    global _ptb_app
+    _ptb_app = build_tg_app()
+    await _ptb_app.initialize()
+    await _ptb_app.start()
+
+    # Set webhook (idempotent)
+    try:
+        await _ptb_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+        logger.info("Telegram webhook set to: %s", WEBHOOK_URL)
+    except Exception:
+        logger.exception("Failed to set Telegram webhook")
+
+@app.on_event("shutdown")
+async def _shutdown():
+    try:
+        if _ptb_app:
+            await _ptb_app.stop()
+    except Exception:
+        logger.exception("Error stopping PTB app")
+    try:
+        if _httpx:
+            await _httpx.aclose()
+    except Exception:
+        logger.exception("Error closing httpx client")
+
+# ---------------- Supabase helpers ----------------
 def _sb() -> Client:
     if supabase is None:
-        raise RuntimeError("Supabase client not initialized yet")
+        raise RuntimeError("Supabase client not initialized")
     return supabase
 
 # ---------------- Models ----------------
@@ -92,7 +138,7 @@ class ClaimIn(BaseModel):
     volume_l: Optional[float] = None
     notes: Optional[str] = None
 
-# ---------------- Helpers ----------------
+# ---------------- Business helpers ----------------
 def get_user_id(telegram_user_id: int) -> str:
     result = (
         _sb().table("user_telegram")
@@ -127,7 +173,6 @@ def current_period(cutoff_day: int, tzname: str) -> Tuple[date, date]:
 
     if now.day <= cutoff_day:
         start_m = month_add(now.replace(day=1), -1)
-        # guard for Feb/non-31 months
         last_day_lookup = [31, 29 if start_m.year % 4 == 0 and (start_m.year % 100 != 0 or start_m.year % 400 == 0) else 28,
                            31,30,31,30,31,31,30,31,30,31]
         start_day = min(cutoff_day + 1, last_day_lookup[start_m.month - 1])
@@ -233,8 +278,8 @@ SOURCE_PATTERNS = [
 def _norm(s: str) -> str:
     s = s.replace("\r", "\n")
     s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\s*-\s*", "-", s)   # "JUL -2025" -> "JUL-2025"
-    s = re.sub(r"\s*/\s*", "/", s)   # "14 / 07 / 2025" -> "14/07/2025"
+    s = re.sub(r"\s*-\s*", "-", s)
+    s = re.sub(r"\s*/\s*", "/", s)
     return s
 
 def _first(patterns, text, flags=re.IGNORECASE):
@@ -325,20 +370,16 @@ async def extract(file: UploadFile = File(...)):
     try:
         if not file:
             raise HTTPException(400, "Missing file field 'file'")
-
         ctype = (file.content_type or "").lower()
         if ctype not in ALLOWED_TYPES:
             raise HTTPException(415, f"Unsupported content type: {file.content_type}")
-
         data = await file.read()
         if not data:
             raise HTTPException(400, "Empty file")
         if len(data) > MAX_BYTES:
             raise HTTPException(413, f"File too large (> {MAX_BYTES} bytes)")
 
-        # If Tesseract is available, use local pipeline; else fallback to OCR.space
         if shutil.which("tesseract"):
-            # write to temp for parse_receipt_image()
             suffix = os.path.splitext(file.filename or "")[-1] or ".jpg"
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp.write(data)
@@ -347,10 +388,8 @@ async def extract(file: UploadFile = File(...)):
                 res = parse_receipt_image(tmp_path)
                 return asdict(res)
             finally:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+                try: os.remove(tmp_path)
+                except Exception: pass
         else:
             if not OCRSPACE_KEY:
                 raise HTTPException(503, "Tesseract not available and OCRSPACE_KEY not set.")
@@ -366,12 +405,10 @@ async def extract(file: UploadFile = File(...)):
                 "volume_l": f.get("volume_l"),
                 "raw_text": text[:5000],
             }
-
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("extract failed")
-        # Always JSON, never HTML
         raise HTTPException(status_code=500, detail=f"/extract failed: {type(e).__name__}: {e}")
 
 # ---------------- Claims API ----------------
@@ -523,10 +560,157 @@ async def extract_bill(
         logger.exception("extract-bill failed")
         raise HTTPException(500, "OCR/parse failed")
 
+# ---------------- Telegram Webhook Route ----------------
+@app.post("/tg/")
+async def tg_webhook(request: Request):
+    """
+    Telegram posts updates here. We convert JSON -> Update and hand to the PTB Application.
+    """
+    if not _ptb_app:
+        raise HTTPException(503, "Telegram bot not initialized")
+    data = await request.json()
+    update = Update.de_json(data, _ptb_app.bot)
+    await _ptb_app.process_update(update)
+    return {"ok": True}
+
+# ---------------- Telegram Bot Logic ----------------
+def build_tg_app() -> Application:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN not set")
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", tg_start))
+    app.add_handler(CommandHandler("help", tg_help))
+    app.add_handler(CommandHandler("health", tg_health))
+    app.add_handler(CommandHandler("claimtype", tg_set_claim_type))
+    app.add_handler(MessageHandler(filters.PHOTO | (filters.Document.IMAGE), tg_handle_image))
+    return app
+
+# ---- TG handlers (async) ----
+async def tg_start(update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Hi! Send me a *photo or image file* of your bill.\n"
+        "I’ll extract details and log your claim automatically.\n\n"
+        "• /help — usage\n"
+        "• /health — API health\n"
+        "• /claimtype fuel|service|insurance|accessories|driver_salary — set default type (per chat)"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+async def tg_help(update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Send a bill *photo* or *image file* (jpg/png/webp). I’ll parse and save it.\n"
+        "Use /claimtype to switch from fuel to others.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+async def tg_health(update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{API_BASE}/health")
+            await update.message.reply_text(r.text)
+    except Exception as e:
+        await update.message.reply_text(f"Health check failed: {e}")
+
+async def tg_set_claim_type(update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /claimtype fuel|service|insurance|accessories|driver_salary")
+    ct = context.args[0].strip().lower()
+    valid = {"fuel", "service", "insurance", "accessories", "driver_salary"}
+    if ct not in valid:
+        return await update.message.reply_text(f"Invalid. Choose one of: {', '.join(sorted(valid))}")
+    context.chat_data["claim_type"] = ct
+    await update.message.reply_text(f"Default claim_type set to *{ct}*", parse_mode=ParseMode.MARKDOWN)
+
+async def tg_handle_image(update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+
+    # Highest-res photo or image-doc
+    file_id = None
+    filename = "bill.jpg"
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        file_id = msg.document.file_id
+        filename = msg.document.file_name or "bill.jpg"
+    else:
+        return await msg.reply_text("Please send a *photo* or *image file* (jpg/png/webp).", parse_mode=ParseMode.MARKDOWN)
+
+    try:
+        await msg.chat.send_action(ChatAction.UPLOAD_PHOTO)
+        tg_file = await context.bot.get_file(file_id)
+        image_bytes = await tg_file.download_as_bytearray()
+
+        # 1) /extract
+        async with httpx.AsyncClient(timeout=120) as client:
+            files = {"file": (filename, bytes(image_bytes), "image/jpeg")}
+            er = await client.post(f"{API_BASE}/extract", files=files)
+            er.raise_for_status()
+            fields = er.json()
+
+        # default claim_type per chat
+        claim_type = context.chat_data.get("claim_type", "fuel")
+
+        # 2) /upload-claim
+        payload = {
+            "telegram_user_id": user.id,
+            "telegram_chat_id": chat.id,
+            "claim_type": claim_type,
+            "claim_date": fields.get("txn_date"),
+            "claim_time": fields.get("time"),
+            "total_rs": fields.get("total_amount"),
+            "station": fields.get("source"),
+            "reference_no": fields.get("transaction_id"),
+            "rate_rs_per_l": fields.get("rate_rs_per_l"),
+            "volume_l": fields.get("volume_l"),
+            "notes": "auto-uploaded from TG",
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            ur = await client.post(f"{API_BASE}/upload-claim", json=payload)
+            if ur.status_code == 404:
+                return await msg.reply_text("You’re not registered. Please link your Telegram in the app.")
+            ur.raise_for_status()
+            upload_ack = ur.json()
+
+        # 3) ACK message
+        parts = [
+            "🧾 *Bill Parsed*",
+            f"*Ref:* `{fields.get('transaction_id') or '—'}`",
+            f"*Date:* `{fields.get('txn_date') or '—'}`  *Time:* `{fields.get('time') or '—'}`",
+            f"*Amount:* ₹{(fields.get('total_amount') or 0):,.2f}",
+        ]
+        if fields.get("source"):
+            parts.append(f"*Station:* {fields['source']}")
+        if fields.get("rate_rs_per_l") and fields.get("volume_l"):
+            parts.append(f"*Rate:* {fields['rate_rs_per_l']}  |  *Vol:* {fields['volume_l']} L")
+
+        if isinstance(upload_ack, dict) and upload_ack.get("ack"):
+            parts.append("\n—\n" + upload_ack["ack"])
+
+        await msg.reply_text("\n".join(parts), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
+    except httpx.HTTPStatusError as he:
+        detail = he.response.text
+        try:
+            j = he.response.json()
+            if isinstance(j, dict) and "detail" in j:
+                detail = j["detail"]
+        except Exception:
+            pass
+        logger.exception("API error: %s", detail)
+        await msg.reply_text(f"❌ API error: {detail}")
+    except Exception as e:
+        logger.exception("Unexpected TG handler error")
+        await msg.reply_text(f"❌ Failed: {e}")
+
 # ---------------- Local run ----------------
 if __name__ == "__main__":
-    # NOTE for Render: prefer gunicorn start command
-    # gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:$PORT --timeout 180
+    # For local dev, this still runs the API on :8000
+    # Webhook requires a public URL (Render). For local testing of the bot:
+    #  - use polling in a separate script, or
+    #  - tunnel (ngrok) and set WEBHOOK_URL to that.
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
