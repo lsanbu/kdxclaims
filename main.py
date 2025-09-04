@@ -27,6 +27,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from supabase import create_client, Client
+from dataclasses import asdict
+from receipt_ocr import parse_receipt_image
+import shutil
+from fastapi import HTTPException
+from dataclasses import asdict
+from receipt_ocr import parse_receipt_image
 
 # ---------- App setup ----------
 load_dotenv()
@@ -167,17 +173,42 @@ def list_users():
     return res.data or []
 
 # ---------- OCR (local Tesseract via receipt_ocr.py) ----------
-from dataclasses import asdict
-from receipt_ocr import parse_receipt_image
-
+# uses your existing _ocrspace_from_file and _parse_bill_text helpers
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     try:
         with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or '')[-1] or ".jpg", delete=False) as tmp:
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
+
+        # If tesseract binary is not present, use OCR.space
+        if shutil.which("tesseract") is None:
+            if not OCRSPACE_KEY:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Tesseract not available and OCRSPACE_KEY not set."
+                )
+            with open(tmp_path, "rb") as fh:
+                text = _ocrspace_from_file(fh.read())
+            fields = _parse_bill_text(text)
+            # Normalize to the same shape as OCRResult (best effort)
+            return {
+                "transaction_id": fields.get("reference_no"),
+                "txn_date": fields.get("txn_date"),
+                "time": None,
+                "total_amount": fields.get("total_amount"),
+                "source": None,
+                "rate_rs_per_l": None,
+                "volume_l": None,
+                "raw_text": text
+            }
+
+        # Normal path (local tesseract)
         res = parse_receipt_image(tmp_path)
         return asdict(res)
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("extract failed")
         raise HTTPException(status_code=500, detail=f"/extract failed: {type(e).__name__}: {e}")
