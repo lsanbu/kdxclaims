@@ -172,12 +172,15 @@ from receipt_ocr import parse_receipt_image
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
-    """OCR a single image and return normalized fields."""
-    with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or '')[-1] or ".jpg", delete=False) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
-    res = parse_receipt_image(tmp_path)
-    return asdict(res)
+    try:
+        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or '')[-1] or ".jpg", delete=False) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            tmp_path = tmp.name
+        res = parse_receipt_image(tmp_path)
+        return asdict(res)
+    except Exception as e:
+        logger.exception("extract failed")
+        raise HTTPException(status_code=500, detail=f"/extract failed: {type(e).__name__}: {e}")
 
 # ---------- Claims API ----------
 @app.post("/upload-claim")
@@ -372,6 +375,19 @@ def _parse_bill_text(text: str):
         "raw_amount_match": amt_raw,
         "preview": t[:600],
     }
+
+# add to main.py
+import shutil, cv2, pytesseract
+
+@app.get("/diag")
+def diag():
+    return {
+        "python": f"{os.sys.version_info.major}.{os.sys.version_info.minor}",
+        "opencv": getattr(cv2, '__version__', None),
+        "tesseract_binary": shutil.which("tesseract"),
+        "tesseract_version": str(pytesseract.get_tesseract_version()) if shutil.which("tesseract") else None,
+    }
+
 
 @app.post("/extract-bill")
 async def extract_bill(
