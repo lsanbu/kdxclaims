@@ -264,6 +264,121 @@ def precutoff_reminders():
             send_tg(chat, msg); sent += 1
     return {"sent": sent}
 
+import re
+from typing import Optional
+from fastapi import UploadFile, File, Form
+from fastapi.responses import JSONResponse
+
+OCRSPACE_KEY = os.getenv("OCRSPACE_KEY")
+OCRSPACE_URL = "https://api.ocr.space/parse/image"
+
+date_patterns = [
+    r"\b(\d{4}[-/]\d{2}[-/]\d{2})\b",      # 2025-09-04 or 2025/09/04
+    r"\b(\d{2}[-/]\d{2}[-/]\d{4})\b",      # 04-09-2025 or 04/09/2025
+    r"\b(\d{1,2}\s*[A-Za-z]{3,9}\s*\d{2,4})\b",  # 4 Sep 2025 / 04 September 25
+]
+amount_patterns = [
+    r"(?:Total(?:\s*Amount)?|Amount\s*Payable|Grand\s*Total)[^\d]{0,10}([\ ₹₹Rs\.]*\d[\d,]*\.?\d{0,2})",
+    r"\b(?:INR|Rs\.?|₹)\s*([\d,]*\.?\d{1,2})\b",
+]
+ref_patterns = [
+    r"(?:Ref(?:erence)?|Invoice|Bill|Receipt|Txn|Transaction|Voucher)\s*(?:No\.?|#|:)?\s*([A-Z0-9\-\/]{5,})",
+]
+
+def _norm_amount(s: str) -> Optional[float]:
+    if not s: return None
+    s = s.replace("₹", "").replace("Rs.", "").replace("Rs", "").replace(" ", "").replace(",", "")
+    try:
+        return float(s)
+    except:
+        return None
+
+def _find_first(patterns, text, flags=re.IGNORECASE):
+    for p in patterns:
+        m = re.search(p, text, flags)
+        if m:
+            return m.group(1).strip()
+    return None
+
+def _ocrspace_from_url(image_url: str) -> str:
+    if not OCRSPACE_KEY:
+        raise HTTPException(500, "OCRSPACE_KEY not configured")
+    resp = requests.post(
+        OCRSPACE_URL,
+        data={"apikey": OCRSPACE_KEY, "url": image_url, "OCREngine": 2, "language": "eng"},
+        timeout=30,
+    )
+    j = resp.json()
+    if not j.get("IsErroredOnProcessing") and j.get("ParsedResults"):
+        return " \n".join(pr.get("ParsedText","") for pr in j["ParsedResults"])
+    raise HTTPException(502, f"OCR failed: {j.get('ErrorMessage')}")
+
+def _ocrspace_from_file(file_bytes: bytes) -> str:
+    if not OCRSPACE_KEY:
+        raise HTTPException(500, "OCRSPACE_KEY not configured")
+    resp = requests.post(
+        OCRSPACE_URL,
+        files={"file": ("bill.jpg", file_bytes)},
+        data={"apikey": OCRSPACE_KEY, "OCREngine": 2, "language": "eng"},
+        timeout=30,
+    )
+    j = resp.json()
+    if not j.get("IsErroredOnProcessing") and j.get("ParsedResults"):
+        return " \n".join(pr.get("ParsedText","") for pr in j["ParsedResults"])
+    raise HTTPException(502, f"OCR failed: {j.get('ErrorMessage')}")
+
+def _parse_bill_text(text: str):
+    # normalize common junk
+    t = re.sub(r"[ \t]+", " ", text)
+    # extract
+    txn_date  = _find_first(date_patterns, t)
+    ref_no    = _find_first(ref_patterns, t)
+    amt_raw   = _find_first(amount_patterns, t)
+    total_amt = _norm_amount(amt_raw)
+    return {
+        "txn_date": txn_date,
+        "reference_no": ref_no,
+        "total_amount": total_amt,
+        "raw_amount_match": amt_raw,
+        "preview": t[:600],  # helpful for debugging
+    }
+
+@app.post("/extract-bill")
+async def extract_bill(
+    image_url: Optional[str] = Form(default=None),
+    file: Optional[UploadFile] = File(default=None),
+    telegram_chat_id: Optional[int] = Form(default=None),  # optional: echo to TG
+):
+    """
+    Send either image_url OR a file. Returns parsed fields.
+    """
+    if not image_url and not file:
+        raise HTTPException(400, "Provide image_url or file")
+
+    try:
+        text = _ocrspace_from_url(image_url) if image_url else _ocrspace_from_file(await file.read())
+        result = _parse_bill_text(text)
+
+        # if you want a nice TG preview
+        if telegram_chat_id:
+            msg = (
+                "🧾 *Bill parsed*\n"
+                f"Ref: `{result.get('reference_no') or '—'}`\n"
+                f"Date: `{result.get('txn_date') or '—'}`\n"
+                f"Total: `{result.get('total_amount') or result.get('raw_amount_match') or '—'}`"
+            )
+            try:
+                send_tg(telegram_chat_id, msg)
+            except Exception as e:
+                print("Non-fatal: telegram send failed:", e)
+
+        return JSONResponse({"ok": True, "fields": result})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("extract-bill failed")
+        raise HTTPException(500, "OCR/parse failed")
+
 # ---------- Local run ----------
 if __name__ == "__main__":
     import uvicorn
